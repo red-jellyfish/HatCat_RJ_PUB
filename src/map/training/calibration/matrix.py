@@ -21,6 +21,17 @@ from collections import defaultdict
 import torch
 from tqdm import tqdm
 
+# Optional statistical estimation (for confidence intervals)
+try:
+    from src.map.statistics import (
+        CalibrationDistribution,
+        CalibrationConfidence,
+        StabilityMetrics,
+    )
+    HAS_STATISTICS = True
+except ImportError:
+    HAS_STATISTICS = False
+
 
 @dataclass
 class CalibrationMatrixConfig:
@@ -60,15 +71,29 @@ class LensStatistics:
     min_rank: int
     max_rank: int
 
+    # Confidence intervals (from bootstrap estimation)
+    rank_ci_lower: float = 0.0
+    rank_ci_upper: float = 0.0
+    activation_ci_lower: float = 0.0
+    activation_ci_upper: float = 0.0
+
     # Frequency statistics
-    times_in_top_k: int
-    total_probes: int  # Total rows where this lens was evaluated
-    observed_frequency: float  # times_in_top_k / total_probes
-    expected_frequency: float  # Based on layer
+    times_in_top_k: int = 0
+    total_probes: int = 0  # Total rows where this lens was evaluated
+    observed_frequency: float = 0.0  # times_in_top_k / total_probes
+    expected_frequency: float = 0.0  # Based on layer
+
+    # Detection rate confidence interval
+    detection_rate_ci_lower: float = 0.0
+    detection_rate_ci_upper: float = 0.0
 
     # Z-score for outlier detection
-    z_score: float
-    status: str  # "normal", "over_firing", "under_firing"
+    z_score: float = 0.0
+    status: str = "normal"  # "normal", "over_firing", "under_firing"
+
+    # Coefficient of variation (stability measure)
+    cv: float = 0.0
+    is_stable: bool = True
 
     # Diagonal rank (rank when own concept is prompted)
     diagonal_rank: Optional[int] = None
@@ -118,6 +143,12 @@ class CalibrationMatrix:
     # Hierarchical consistency
     hierarchical_violations: List[Dict] = field(default_factory=list)
     hierarchical_consistency_rate: float = 0.0
+
+    # Statistical estimation (from Méloux et al. 2025)
+    topk_jaccard_mean: float = 0.0  # Structural stability of top-k across probes
+    topk_jaccard_std: float = 0.0
+    stable_lens_count: int = 0  # Lenses with CV < threshold
+    unstable_lens_count: int = 0
 
 
 class CalibrationMatrixBuilder:
@@ -448,6 +479,38 @@ class CalibrationMatrixBuilder:
                 diagonal_rank = matrix.matrix[concept][concept]
                 diagonal_activation = matrix.activations[concept].get(concept)
 
+            # Compute confidence intervals using statistics module
+            rank_ci_lower = rank_ci_upper = mean_rank
+            activation_ci_lower = activation_ci_upper = 0.0
+            det_ci_lower = det_ci_upper = observed_freq
+            cv = std_rank / mean_rank if mean_rank > 0 else 0.0
+            is_stable = cv < 0.5  # Default threshold
+
+            if HAS_STATISTICS and len(ranks) >= 2:
+                # Get activations for this lens
+                lens_activations = []
+                for row_concept_name in matrix.activations:
+                    if concept in matrix.activations[row_concept_name]:
+                        lens_activations.append(matrix.activations[row_concept_name][concept])
+
+                from src.map.statistics import compute_calibration_confidence
+                conf = compute_calibration_confidence(
+                    ranks=ranks,
+                    activations=lens_activations[:len(ranks)],  # Match length
+                    top_k=self.config.top_k,
+                    concept=concept,
+                    layer=layer,
+                    n_bootstrap=500,  # Faster for calibration
+                )
+                rank_ci_lower = conf.rank_ci_lower
+                rank_ci_upper = conf.rank_ci_upper
+                activation_ci_lower = conf.activation_ci_lower
+                activation_ci_upper = conf.activation_ci_upper
+                det_ci_lower = conf.detection_rate_ci_lower
+                det_ci_upper = conf.detection_rate_ci_upper
+                cv = conf.cv
+                is_stable = conf.is_stable
+
             stats = LensStatistics(
                 concept=concept,
                 layer=layer,
@@ -456,16 +519,30 @@ class CalibrationMatrixBuilder:
                 median_rank=median_rank,
                 min_rank=int(min(ranks)),
                 max_rank=int(max(ranks)),
+                rank_ci_lower=rank_ci_lower,
+                rank_ci_upper=rank_ci_upper,
+                activation_ci_lower=activation_ci_lower,
+                activation_ci_upper=activation_ci_upper,
                 times_in_top_k=in_top_k,
                 total_probes=total_probes,
                 observed_frequency=observed_freq,
                 expected_frequency=expected_freq,
+                detection_rate_ci_lower=det_ci_lower,
+                detection_rate_ci_upper=det_ci_upper,
                 z_score=z_score,
                 status=status,
+                cv=cv,
+                is_stable=is_stable,
                 diagonal_rank=diagonal_rank,
                 diagonal_activation=diagonal_activation,
                 over_fires_on=over_fires.get(lens_key, [])[:20],  # Top 20
             )
+
+            # Track stable/unstable counts
+            if is_stable:
+                matrix.stable_lens_count += 1
+            else:
+                matrix.unstable_lens_count += 1
 
             matrix.lens_stats[concept] = stats
 
@@ -520,6 +597,38 @@ class CalibrationMatrixBuilder:
         print(f"  Hierarchical consistency: {matrix.hierarchical_consistency_rate:.1%}")
         print(f"  Violations: {len(violations)}")
 
+        # Compute top-k structural stability using Jaccard similarity
+        if HAS_STATISTICS:
+            print("\nComputing structural stability (Jaccard)...")
+            # Collect top-k sets for each probe
+            top_k_sets = []
+            for row_concept in matrix.matrix:
+                row_data = matrix.matrix[row_concept]
+                # Get concepts with rank <= top_k
+                top_k_concepts = {c for c, r in row_data.items() if r <= self.config.top_k}
+                if top_k_concepts:
+                    top_k_sets.append(top_k_concepts)
+
+            if len(top_k_sets) >= 2:
+                from src.map.statistics import compute_jaccard_similarity
+                # Compute pairwise Jaccard (sample for efficiency if many probes)
+                sample_size = min(100, len(top_k_sets))
+                import random
+                sampled = random.sample(top_k_sets, sample_size)
+
+                jaccards = []
+                for i in range(len(sampled)):
+                    for j in range(i + 1, len(sampled)):
+                        j_score = compute_jaccard_similarity(sampled[i], sampled[j])
+                        jaccards.append(j_score)
+
+                if jaccards:
+                    matrix.topk_jaccard_mean = float(np.mean(jaccards))
+                    matrix.topk_jaccard_std = float(np.std(jaccards))
+                    print(f"  Top-k Jaccard: mean={matrix.topk_jaccard_mean:.3f}, std={matrix.topk_jaccard_std:.3f}")
+
+            print(f"  Stable lenses: {matrix.stable_lens_count}, Unstable: {matrix.unstable_lens_count}")
+
         return matrix
 
     def save_matrix(self, matrix: CalibrationMatrix, output_path: Optional[Path] = None):
@@ -542,6 +651,11 @@ class CalibrationMatrixBuilder:
                 'rank_mean': matrix.rank_mean,
                 'rank_std': matrix.rank_std,
                 'hierarchical_consistency_rate': matrix.hierarchical_consistency_rate,
+                # Statistical estimation metrics (Méloux et al. 2025)
+                'topk_jaccard_mean': matrix.topk_jaccard_mean,
+                'topk_jaccard_std': matrix.topk_jaccard_std,
+                'stable_lens_count': matrix.stable_lens_count,
+                'unstable_lens_count': matrix.unstable_lens_count,
             },
             'distribution': {
                 'histogram': matrix.rank_histogram,
@@ -593,6 +707,11 @@ def print_matrix_summary(matrix: CalibrationMatrix):
     print(f"  Hierarchical consistency: {matrix.hierarchical_consistency_rate:.1%}")
     print(f"  Over-firing concepts: {len(matrix.over_firing_concepts)}")
     print(f"  Under-firing concepts: {len(matrix.under_firing_concepts)}")
+    print()
+    print("Statistical Estimation (Méloux et al. 2025):")
+    print(f"  Top-k Jaccard stability: mean={matrix.topk_jaccard_mean:.3f}, std={matrix.topk_jaccard_std:.3f}")
+    print(f"  Stable lenses (CV < 0.5): {matrix.stable_lens_count}")
+    print(f"  Unstable lenses: {matrix.unstable_lens_count}")
 
     if matrix.over_firing_concepts:
         print(f"\n  Top over-firing (z > {matrix.config.over_firing_z_threshold}):")

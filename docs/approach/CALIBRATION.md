@@ -213,9 +213,194 @@ Calibration is complete when:
 - `src/training/calibration/finetune.py` - Contrastive fine-tuning
 - `src/training/calibration/cycle.py` - Iterative calibration cycles
 
+## Full Calibration Pipeline Architecture
+
+The complete calibration pipeline connects training-time calibration to runtime normalization and significance scoring. Understanding this end-to-end flow is critical for proper HUSH configuration.
+
+### Pipeline Overview
+
+```
+┌─────────────────────────────────────────────────────────────────────────────┐
+│                        CALIBRATION PIPELINE                                  │
+├─────────────────────────────────────────────────────────────────────────────┤
+│                                                                              │
+│  ┌─────────────────┐    ┌─────────────────┐    ┌─────────────────┐          │
+│  │  TRAINING-TIME  │    │   GENERATION    │    │    RUNTIME      │          │
+│  │   CALIBRATION   │ →  │   CALIBRATION   │ →  │  NORMALIZATION  │          │
+│  └─────────────────┘    └─────────────────┘    └─────────────────┘          │
+│         ↓                      ↓                       ↓                     │
+│  Triple-Criteria        cross_fire_rate         ConceptCalibration          │
+│  (ancestor/sibling/     gen_fire_rate           .normalize()                │
+│   random)               self_mean/cross_mean    → [0,1] confidence          │
+│                                                                              │
+│                                ↓                                             │
+│                    ┌─────────────────────┐                                   │
+│                    │ SIGNIFICANCE SCORING │                                  │
+│                    └─────────────────────┘                                   │
+│                             ↓                                                │
+│                    Distinguish decision                                      │
+│                    tokens from filler                                        │
+│                                                                              │
+└─────────────────────────────────────────────────────────────────────────────┘
+```
+
+### Phase 1: Training-Time Calibration
+
+**Purpose**: Ensure lenses fire correctly on their target concepts.
+
+**Process**: `src/map/training/calibration/cycle.py`
+1. **Analysis**: Score all concepts, check ancestor/sibling/random criteria
+2. **Fine-tune**: Contrastive training to fix failures
+3. **Repeat**: Until >90% pass rate on all criteria
+
+**Output**: Corrected lens weights (.pt files)
+
+### Phase 2: Generation Calibration
+
+**Purpose**: Measure how lenses behave during normal text generation (not concept prompts).
+
+**Process**: `scripts/tools/calibrate_cross_activation.py --mode generation`
+
+For each lens, measures:
+- **self_mean**: Average activation when own concept is prompted
+- **cross_mean**: Average activation on other concepts' prompts (where it fired)
+- **cross_fire_rate** (CFR): Fraction of OTHER concept prompts it fired on
+- **gen_fire_rate** (GFR): Fraction of GENERATION tokens it fired on
+
+**Interpretation**:
+| Metric | Good | Problematic |
+|--------|------|-------------|
+| CFR | <20% | >50% = "over-firer" |
+| GFR | <20% | >30% = noisy on generation |
+| Gap (self_mean - cross_mean) | >0.2 | <0.1 = poor discrimination |
+
+**Output**: `calibration.json` in lens pack directory
+
+### Phase 3: Runtime Normalization
+
+**Purpose**: Transform raw activation probabilities to confidence-weighted scores.
+
+**Implementation**: `ConceptCalibration.normalize()` in `deployment_manifest.py`
+
+Three-stage transformation:
+
+**Stage 1: Range Transformation**
+```
+Maps: [0, cross_mean, self_mean, 1.0] → [0, 0.5, 1.0, beyond]
+
+If raw_prob >= cross_mean:
+    range_transformed = 0.5 + 0.5 * (raw_prob - cross_mean) / gap
+Else:
+    range_transformed = 0.5 * raw_prob / cross_mean
+```
+
+**Stage 2: Confidence Weighting**
+```
+confidence = (1 - CFR) × (1 - GFR) × gap_confidence
+
+Where gap_confidence = min(1.0, gap / 0.2)
+
+Result = 0.5 + (range_transformed - 0.5) × confidence
+```
+
+Critical insight: **Over-firers (CFR=100%) get confidence=0**, meaning their normalized score is stuck at ~0.5 regardless of raw activation. This automatically disables unreliable lenses.
+
+**Stage 3: Sigmoid Compression**
+```
+output = sigmoid(steepness × (x - 0.5))
+
+With steepness=6: maps approximately [0,1] → [0.05, 0.95]
+```
+
+### Phase 4: Significance Scoring
+
+**Purpose**: Distinguish "decision" tokens from "filler" tokens.
+
+**Implementation**: `src/hush/prod_sig.py`
+
+Uses three signals:
+1. **Activation Delta**: How much hidden state changed between layers
+2. **Entropy over Top-K**: Concentrated (low entropy) = decision point
+3. **Max Above Noise Floor**: Clear signal above calibrated baseline
+
+**Calibrated Defaults** (from gemma-3-4b_first-light-v1):
+- default_noise_floor: 0.60 (median gen_mean across concepts)
+- entropy_thresh: 2.0 (~log(8) for top-8)
+- max_above_thresh: 0.05 (5% above noise floor)
+
+### How This Affects HUSH Thresholds
+
+HUSH constraints use thresholds in **normalized space**:
+
+```yaml
+hush:
+  honest_steering:
+    constraints:
+      - simplex_term: "Deception"
+        max_deviation: 0.7  # In normalized space!
+```
+
+**Key relationships**:
+- Threshold 0.5 = fires at noise floor (always triggers)
+- Threshold 0.7 = requires ~40% above noise floor in raw space
+- Threshold 0.9 = requires strong, high-confidence signal
+
+For a lens with:
+- self_mean=0.87, cross_mean=0.58, CFR=2%, GFR=0%
+- gap=0.29, gap_confidence=1.0, confidence=0.98
+
+A raw activation of 0.67 would normalize to:
+```
+range_transformed = 0.5 + 0.5 × (0.67 - 0.58) / 0.29 = 0.655
+confidence_weighted = 0.5 + (0.655 - 0.5) × 0.98 = 0.652
+after_sigmoid ≈ 0.71
+```
+
+So threshold 0.7 would trigger at raw~0.67.
+
+### Hierarchy and Dynamic Loading
+
+The concept hierarchy affects lens loading:
+
+**Always-loaded layers**: L0, L1, L2 (base coverage)
+- All base layer concepts have lenses
+- These lenses are kept in memory permanently
+
+**Dynamic loading** (L3+):
+- When parent confidence exceeds threshold → load children
+- Requires parent to have a lens AND fire above threshold
+- Full parent chain must fire: L0→L1→L2→...→target
+
+**Example loading path for HonestDefaults (L5)**:
+```
+MindsAndAgents(L0) → AgentAction(L1) → CreativeActivities(L2) →
+PersuasiveCommunication(L3) → EthicalDesign(L4) → HonestDefaults(L5)
+```
+
+Each ancestor must fire above its threshold to load the next layer's children.
+
+### Pack Usability Analysis
+
+From first-light-v1 calibration (7,696 concepts):
+
+| Category | Count | Percentage |
+|----------|-------|------------|
+| Reliable (CFR<20%, GFR<20%) | ~27.5% | Usable for detection |
+| Over-firers (CFR>50%) | ~51% | Auto-disabled by normalization |
+| High GFR (GFR>20%) | ~15% | Noisy on generation |
+| Mixed issues | ~6.5% | Case-by-case evaluation |
+
+### Cross-References
+
+- **Statistical framework**: `docs/implementation/STATISTICAL_ESTIMATION_FRAMEWORK.md`
+- **Significance scoring**: `docs/implementation/HUSH_SIGNIFICANCE_SCORING.md`
+- **HUSH safety harness**: `docs/specification/HUSH/HUSH_SAFETY_HARNESS.md`
+- **Dynamic loading**: `docs/approach/dynamic_lens_loading.md`
+
 ## Future Work
 
 - **Adaptive thresholds**: Learn pass rates from data rather than fixed 80%
 - **Cross-pack calibration**: Ensure consistency when multiple packs are loaded
 - **Online calibration**: Adjust based on production activation patterns
 - **Hierarchical batching**: Process by layer for more efficient calibration
+- **Per-concept noise floors**: Use calibrated gen_mean per concept in significance scoring

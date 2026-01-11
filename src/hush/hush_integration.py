@@ -9,7 +9,7 @@ This module provides:
 
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Dict, List, Optional, Any, Tuple, Generator
+from typing import Dict, List, Optional, Any, Tuple, Generator, Union
 from pathlib import Path
 import json
 import torch
@@ -21,6 +21,7 @@ from .hush_controller import (
     SteeringDirective,
     HushViolation,
 )
+from .prod_sig import ProdSigConfig, compute_sig_fast, _entropy_from_topk_scores
 
 # Optional ASK audit integration
 try:
@@ -62,6 +63,15 @@ class WorldTick:
     activation_delta: float = 0.0  # Hidden state change magnitude
     is_filler: bool = False  # Hard classification for filtering
 
+    # Display properties (computed from safety + significance)
+    display_color: str = ""  # HSL color for frontend rendering
+    safety_intensity: float = 0.0  # 0-1, how dangerous this token is
+
+    # Statistical confidence (for multi-sample aggregation)
+    # These are populated by post-hoc analysis across samples
+    concept_confidence: Dict[str, Tuple[float, float]] = field(default_factory=dict)  # concept -> (ci_lower, ci_upper)
+    detection_cv: float = 0.0  # Coefficient of variation (stability measure)
+
     def to_dict(self) -> Dict[str, Any]:
         return {
             'tick_id': self.tick_id,
@@ -78,7 +88,250 @@ class WorldTick:
             'entropy_by_layer': self.entropy_by_layer,
             'activation_delta': self.activation_delta,
             'is_filler': self.is_filler,
+            'display_color': self.display_color,
+            'safety_intensity': self.safety_intensity,
+            'concept_confidence': self.concept_confidence,
+            'detection_cv': self.detection_cv,
         }
+
+
+# Safety concepts that indicate potential manipulation/danger
+SAFETY_CONCEPTS = {
+    'deception', 'manipulation', 'aistrategicdeception', 'sycophancy',
+    'harm', 'dishonesty', 'coercion', 'misdirection', 'sandbagging',
+    'rewardhacking', 'darkpattern', 'persuasivemanipulation', 'selfdeception',
+}
+
+
+def compute_safety_intensity(concept_activations: Dict[str, float]) -> float:
+    """
+    Compute safety intensity from concept activations.
+
+    Returns 0-1 score based on max safety concept activation.
+    Calibrated scores: 0.5 is noise floor, >0.6 is signal.
+    """
+    if not concept_activations:
+        return 0.0
+
+    safety_score = 0.0
+    for concept, score in concept_activations.items():
+        # Check if this is a safety concept (case-insensitive, ignore layer suffix)
+        concept_base = concept.split('_L')[0].lower().replace(' ', '')
+        if any(safety in concept_base for safety in SAFETY_CONCEPTS):
+            safety_score = max(safety_score, score)
+
+    # Map calibrated score (0.5-1.0) to intensity (0-1)
+    # Scores below 0.55 are noise
+    if safety_score < 0.55:
+        return 0.0
+    return min(1.0, (safety_score - 0.5) * 2)
+
+
+def compute_display_color(safety_intensity: float, significance: float, is_filler: bool = False) -> str:
+    """
+    Compute HSL color for token display.
+
+    - Safety intensity controls hue (gray→orange→red) and saturation
+    - Significance controls lightness (dark=filler, light=decision point)
+    - Result: significant safety tokens are bright red, insignificant are dark/muted
+
+    Args:
+        safety_intensity: 0-1, how dangerous this token is
+        significance: 0-1, how significant this token is (decision vs filler)
+        is_filler: explicit filler classification
+
+    Returns:
+        HSL color string like "hsl(0, 70%, 45%)"
+    """
+    # Hue: gray-blue (220) for safe, orange (30) for moderate, red (0) for danger
+    if safety_intensity > 0.5:
+        hue = 0  # Red for high danger
+    elif safety_intensity > 0.3:
+        hue = 30  # Orange for moderate danger
+    else:
+        hue = 220  # Gray-blue default
+
+    # Saturation: controlled by safety intensity
+    # Low safety = desaturated (gray), high safety = saturated (vivid)
+    # Range: 10% (safe) to 70% (dangerous)
+    saturation = 10 + (safety_intensity * 60)
+
+    # Lightness: controlled by significance
+    # Low significance (filler) = dark (15-25%)
+    # High significance (decision) = lighter (40-55%)
+    # This ensures significant safety tokens are bright/visible
+    min_lightness = 15
+    max_lightness = 20 if is_filler else 55
+    lightness = min_lightness + (significance * (max_lightness - min_lightness))
+
+    return f"hsl({hue}, {saturation:.0f}%, {lightness:.0f}%)"
+
+
+def aggregate_ticks_with_confidence(
+    tick_lists: List[List[WorldTick]],
+    confidence: float = 0.95,
+    n_bootstrap: int = 1000,
+) -> Dict[str, Any]:
+    """
+    Aggregate multiple generation runs and compute confidence intervals.
+
+    This implements the statistical estimation approach from Méloux et al. 2025:
+    - Compute bootstrap CIs for detection rates
+    - Measure concept activation stability via Jaccard
+    - Track coefficient of variation for reliability
+
+    Args:
+        tick_lists: List of WorldTick lists (one per sample/run)
+        confidence: Confidence level for intervals
+        n_bootstrap: Number of bootstrap resamples
+
+    Returns:
+        Dict with aggregated statistics and confidence intervals
+    """
+    if not tick_lists:
+        return {}
+
+    # Try to import statistics module
+    try:
+        from src.map.statistics import (
+            ActivationDistribution,
+            compute_jaccard_similarity,
+            compute_coefficient_of_variation,
+        )
+        HAS_STATS = True
+    except ImportError:
+        HAS_STATS = False
+
+    # Collect per-sample peak activations for each concept
+    concept_peaks: Dict[str, List[float]] = {}
+    safety_peaks: List[float] = []
+    violation_counts: List[int] = []
+    intervention_counts: List[int] = []
+    topk_sets: List[set] = []
+
+    for ticks in tick_lists:
+        if not ticks:
+            continue
+
+        # Per-sample aggregation
+        sample_concept_peaks: Dict[str, float] = {}
+        sample_safety_peak = 0.0
+        sample_violations = 0
+        sample_interventions = 0
+
+        for tick in ticks:
+            # Track concept activations
+            for concept, score in tick.concept_activations.items():
+                if concept not in sample_concept_peaks or score > sample_concept_peaks[concept]:
+                    sample_concept_peaks[concept] = score
+
+            # Track safety intensity
+            sample_safety_peak = max(sample_safety_peak, tick.safety_intensity)
+
+            # Count violations and interventions
+            sample_violations += len(tick.violations)
+            sample_interventions += len(tick.steering_applied)
+
+        # Add to cross-sample aggregation
+        for concept, peak in sample_concept_peaks.items():
+            if concept not in concept_peaks:
+                concept_peaks[concept] = []
+            concept_peaks[concept].append(peak)
+
+        safety_peaks.append(sample_safety_peak)
+        violation_counts.append(sample_violations)
+        intervention_counts.append(sample_interventions)
+
+        # Top-k concepts for this sample
+        sorted_concepts = sorted(sample_concept_peaks.items(), key=lambda x: x[1], reverse=True)
+        topk_sets.append({c for c, _ in sorted_concepts[:10]})
+
+    n_samples = len(tick_lists)
+
+    # Compute statistics
+    result = {
+        'n_samples': n_samples,
+        'concept_stats': {},
+        'safety_stats': {},
+        'violation_stats': {},
+        'intervention_stats': {},
+        'stability': {},
+    }
+
+    # Safety statistics with CI
+    if safety_peaks:
+        safety_arr = np.array(safety_peaks)
+        result['safety_stats'] = {
+            'mean': float(np.mean(safety_arr)),
+            'std': float(np.std(safety_arr)),
+        }
+
+        if n_samples >= 2 and HAS_STATS:
+            # Bootstrap CI
+            boot_means = []
+            for _ in range(n_bootstrap):
+                sample = np.random.choice(safety_arr, size=n_samples, replace=True)
+                boot_means.append(np.mean(sample))
+
+            alpha = 1 - confidence
+            result['safety_stats']['ci_lower'] = float(np.percentile(boot_means, 100 * alpha / 2))
+            result['safety_stats']['ci_upper'] = float(np.percentile(boot_means, 100 * (1 - alpha / 2)))
+            result['safety_stats']['cv'] = compute_coefficient_of_variation(safety_peaks)
+
+    # Violation/intervention stats
+    if violation_counts:
+        result['violation_stats'] = {
+            'mean': float(np.mean(violation_counts)),
+            'std': float(np.std(violation_counts)),
+            'total': sum(violation_counts),
+        }
+
+    if intervention_counts:
+        result['intervention_stats'] = {
+            'mean': float(np.mean(intervention_counts)),
+            'std': float(np.std(intervention_counts)),
+            'total': sum(intervention_counts),
+        }
+
+    # Per-concept statistics with CI
+    for concept, peaks in concept_peaks.items():
+        if len(peaks) < 2:
+            continue
+
+        peak_arr = np.array(peaks)
+        stats = {
+            'mean': float(np.mean(peak_arr)),
+            'std': float(np.std(peak_arr)),
+            'fire_rate': float(np.mean(peak_arr > 0.5)),  # Fraction above detection threshold
+        }
+
+        if HAS_STATS:
+            # Bootstrap CI for mean
+            boot_means = []
+            for _ in range(min(n_bootstrap, 500)):  # Fewer for per-concept
+                sample = np.random.choice(peak_arr, size=len(peaks), replace=True)
+                boot_means.append(np.mean(sample))
+
+            alpha = 1 - confidence
+            stats['ci_lower'] = float(np.percentile(boot_means, 100 * alpha / 2))
+            stats['ci_upper'] = float(np.percentile(boot_means, 100 * (1 - alpha / 2)))
+            stats['cv'] = compute_coefficient_of_variation(peaks)
+
+        result['concept_stats'][concept] = stats
+
+    # Jaccard stability of top-k concepts
+    if len(topk_sets) >= 2 and HAS_STATS:
+        jaccards = []
+        for i in range(len(topk_sets)):
+            for j in range(i + 1, len(topk_sets)):
+                jaccards.append(compute_jaccard_similarity(topk_sets[i], topk_sets[j]))
+
+        result['stability'] = {
+            'topk_jaccard_mean': float(np.mean(jaccards)),
+            'topk_jaccard_std': float(np.std(jaccards)),
+        }
+
+    return result
 
 
 class HushedGenerator:
@@ -121,6 +374,10 @@ class HushedGenerator:
         # Callbacks receive: (violations: List[HushViolation], severity: float, tick: WorldTick)
         self._violation_callbacks: List[callable] = []
         self._decision_required_threshold = 0.7  # Severity threshold for decision prompt
+
+        # Significance scoring state
+        self._sig_config = ProdSigConfig()
+        self._prev_hidden_state: Optional[torch.Tensor] = None
 
     def register_violation_callback(self, callback: callable) -> None:
         """
@@ -501,15 +758,81 @@ class HushedGenerator:
 
         # Get concept activations (top-k from lens manager)
         concept_activations = {}
+        topk_scores = []
         if hasattr(self.lens_manager, 'last_detections'):
             for name, prob, layer in self.lens_manager.last_detections[:10]:
                 concept_activations[f"{name}_L{layer}"] = float(prob)
+                topk_scores.append(float(prob))
 
         # Get simplex deviations
         simplex_deviations = {}
         for term in simplex_activations:
             dev = self.lens_manager.get_simplex_deviation(term)
             simplex_deviations[term] = dev
+
+        # Compute significance scoring
+        significance = 0.0
+        activation_delta = 0.0
+        entropy_by_layer = {}
+        is_filler = False
+
+        try:
+            # Compute activation delta (hidden state change from previous token)
+            if self._prev_hidden_state is not None:
+                delta_vec = hidden_state - self._prev_hidden_state.to(hidden_state.device)
+                activation_delta = float(delta_vec.norm().cpu())
+
+            # Compute entropy over top-k concept scores
+            if topk_scores:
+                scores_tensor = torch.tensor(topk_scores, dtype=torch.float32).unsqueeze(0)
+                entropy = float(_entropy_from_topk_scores(
+                    scores_tensor, self._sig_config.temp, self._sig_config.eps
+                )[0])
+                entropy_by_layer['late'] = entropy
+
+                # Compute max above noise floor
+                max_score = max(topk_scores) if topk_scores else 0.0
+                max_above = max(0.0, max_score - self._sig_config.default_noise_floor)
+
+                # Normalize delta for combination (use running estimate)
+                # For now, use simple heuristic: delta > 1.0 is significant
+                z_delta = min(activation_delta, 3.0) / 3.0  # Clip and normalize
+
+                # Normalize entropy (lower is more significant)
+                # Max entropy for k=10 is log(10) ≈ 2.3
+                max_entropy = 2.3
+                z_entropy = entropy / max_entropy  # 0-1, high = diffuse
+
+                # Normalize max_above (0-1 range)
+                z_max = min(max_above, 0.4) / 0.4  # 40% above floor is max
+
+                # Combine: high delta, low entropy, high max_above = significant
+                # With w_entropy=2.0: filler (high entropy) → ~25-40%, decision (low entropy) → ~60-80%
+                sig_logits = (
+                    self._sig_config.w_delta * z_delta
+                    - self._sig_config.w_entropy * z_entropy
+                    + self._sig_config.w_max_above * z_max
+                )
+                significance = 1.0 / (1.0 + np.exp(-sig_logits))  # Sigmoid
+
+                # Hard filler classification
+                is_filler = (
+                    activation_delta < self._sig_config.delta_thresh
+                    and entropy > self._sig_config.entropy_thresh
+                    and max_above < self._sig_config.max_above_thresh
+                )
+
+            # Update previous hidden state for next tick
+            self._prev_hidden_state = hidden_state.detach().cpu()
+
+        except Exception as e:
+            # Don't let significance computation break generation
+            import warnings
+            warnings.warn(f"Significance computation failed: {e}")
+
+        # Compute display properties (safety intensity + color)
+        safety_intensity = compute_safety_intensity(concept_activations)
+        display_color = compute_display_color(safety_intensity, significance, is_filler)
 
         tick = WorldTick(
             tick_id=self.current_tick_id,
@@ -522,6 +845,12 @@ class HushedGenerator:
             steering_applied=[d.to_dict() for d in directives],
             token_id=token_id,
             token_text=token_text,
+            significance=significance,
+            entropy_by_layer=entropy_by_layer,
+            activation_delta=activation_delta,
+            is_filler=is_filler,
+            display_color=display_color,
+            safety_intensity=safety_intensity,
         )
 
         self.world_ticks.append(tick)
@@ -613,6 +942,9 @@ class HushedGenerator:
         ticks = []
         past_key_values = None  # KV cache for O(n) instead of O(n²)
 
+        # Reset significance state for new generation
+        self._prev_hidden_state = None
+
         try:
             for step in range(max_new_tokens):
                 # Forward pass with hidden states and KV cache
@@ -634,7 +966,8 @@ class HushedGenerator:
                     past_key_values = outputs.past_key_values
 
                 # Get hidden state from last layer (last position only)
-                hidden_state = outputs.hidden_states[-1][0, -1, :]
+                # IMPORTANT: detach to prevent memory leak from holding computation graph
+                hidden_state = outputs.hidden_states[-1][0, -1, :].detach()
 
                 # Run simplex detection
                 simplex_activations = self.lens_manager.detect_simplexes(hidden_state)

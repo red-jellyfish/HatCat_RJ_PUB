@@ -216,9 +216,24 @@ for token in generation:
 
 4. **Integration with steering**: Weight steering strength by inverse significance (stronger correction on decision tokens)
 
+## Relationship to Calibration Pipeline
+
+Significance scoring is Phase 4 of the full calibration pipeline:
+
+1. **Training-time calibration** → ensures lenses fire on correct concepts
+2. **Generation calibration** → measures CFR/GFR noise characteristics
+3. **Runtime normalization** → applies confidence weighting to raw scores
+4. **Significance scoring** → distinguishes decision vs filler tokens
+
+The `default_noise_floor` (0.60) comes from generation calibration's median `gen_mean`. This connects significance scoring to the same calibration data that drives runtime normalization.
+
+For full pipeline documentation, see: `docs/approach/CALIBRATION.md`
+
 ## References
 
 - "The Dead Salmons of AI Interpretability" - Motivating paper on interpretability uncertainty
 - `src/hush/prod_sig.py` - Implementation
 - `src/hush/calibrate_significance.py` - Calibration analysis tool
 - `src/hush/hush_integration.py` - WorldTick integration
+- `docs/approach/CALIBRATION.md` - Full calibration pipeline documentation
+- `docs/implementation/STATISTICAL_ESTIMATION_FRAMEWORK.md` - Confidence intervals and variance

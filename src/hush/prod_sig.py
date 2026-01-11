@@ -33,8 +33,9 @@ class ProdSigConfig:
     eps: float = 1e-8
 
     # Feature weights for significance score
+    # Entropy weighted higher for discrimination: high entropy = filler, low = decision
     w_delta: float = 1.0
-    w_entropy: float = 1.0
+    w_entropy: float = 2.0  # Increased from 1.0 for better filler/decision separation
     w_max_above: float = 1.0
     w_entropy_drop: float = 0.5  # Weight for layer-wise entropy cascade
 
@@ -42,12 +43,12 @@ class ProdSigConfig:
     # delta_thresh: tokens with hidden state delta below this are likely filler
     delta_thresh: float = 0.1  # conservative - needs per-model calibration
     # entropy_thresh: high entropy = diffuse activations = filler
-    entropy_thresh: float = 2.0  # ~log(k) for k=8 top concepts
+    entropy_thresh: float = 1.8  # Lowered for stricter filler detection
     # max_above_thresh: activation must exceed noise floor by this margin
-    max_above_thresh: float = 0.05  # 5% above noise floor
+    max_above_thresh: float = 0.10  # 10% above noise floor (raised with lower floor)
 
-    # Default noise floor from calibration (median gen_mean = 0.6067)
-    default_noise_floor: float = 0.60
+    # Default noise floor - post-normalization baseline (calibration pulls to ~0.5)
+    default_noise_floor: float = 0.50
 
     # Layer-aware settings
     use_layer_cascade: bool = True
