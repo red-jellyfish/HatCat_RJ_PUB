@@ -54,6 +54,7 @@ def run_calibration_cycle(
     cross_activation_threshold: float = 0.5,
     use_activation_cache: bool = True,
     model_name: str = "",
+    run_validation: bool = True,
 ) -> Dict:
     """
     Run iterative calibration cycles.
@@ -68,6 +69,8 @@ def run_calibration_cycle(
     5. Run cross-activation calibration to measure per-concept noise floors
        This produces calibration.json with self_mean/cross_mean per concept,
        enabling normalized scores at inference (1.0=signal, 0.5=noise floor, 0.0=floor)
+    6. Run validation to compute quality metrics (diagonal rank, Jaccard stability)
+       These are merged into calibration.json for downstream consumers
 
     Returns:
         Dict with cycle history and final metrics
@@ -285,6 +288,39 @@ def run_calibration_cycle(
                       f"cross_rate={c['cross_fire_rate']:.3f} "
                       f"self={c['self_mean']:.2f} cross={c['cross_mean']:.2f}")
 
+    # Step 4: Validation (final step)
+    validation_result = None
+    if run_validation:
+        print(f"\n{'='*80}")
+        print("VALIDATION")
+        print(f"{'='*80}")
+        print("  Computing quality metrics (diagonal rank, Jaccard stability)...")
+
+        from .validation import run_validation as run_validation_step, merge_validation_into_calibration
+
+        validation_result = run_validation_step(
+            lens_pack_dir=lens_pack_dir,
+            concept_pack_dir=concept_pack_dir,
+            model=model,
+            tokenizer=tokenizer,
+            device=device,
+            layers=layers,
+            top_k=top_k,
+            max_concepts=max_concepts,
+            layer_idx=layer_idx,
+        )
+
+        # Save standalone validation.json
+        validation_path = lens_pack_dir / "validation.json"
+        with open(validation_path, 'w') as f:
+            json.dump(asdict(validation_result), f, indent=2)
+        print(f"\n  ✓ Saved validation to: {validation_path}")
+
+        # Merge into calibration.json if it exists
+        calibration_path = lens_pack_dir / "calibration.json"
+        if calibration_path.exists():
+            merge_validation_into_calibration(calibration_path, validation_result)
+
     # Save summary
     summary = {
         'lens_pack_id': lens_pack_dir.name,
@@ -299,6 +335,12 @@ def run_calibration_cycle(
             'enabled': run_cross_activation,
             'concepts_calibrated': len(cross_activation_result.get('calibration', {})) if cross_activation_result else 0,
         } if run_cross_activation else None,
+        'validation': {
+            'enabled': run_validation,
+            'diagonal_in_top_k_rate': validation_result.diagonal_in_top_k_rate if validation_result else 0,
+            'avg_diagonal_rank': validation_result.avg_diagonal_rank if validation_result else 0,
+            'topk_jaccard_mean': validation_result.topk_jaccard_mean if validation_result else 0,
+        } if run_validation else None,
     }
 
     summary_path = lens_pack_dir / "calibration_summary.json"
@@ -342,6 +384,8 @@ def main():
                         help='Firing threshold for cross-activation')
     parser.add_argument('--no-cache', action='store_true',
                         help='Disable activation caching (regenerate activations each cycle)')
+    parser.add_argument('--no-validation', action='store_true',
+                        help='Skip validation step (runs by default)')
 
     args = parser.parse_args()
 
@@ -417,6 +461,7 @@ def main():
         cross_activation_threshold=args.cross_activation_threshold,
         use_activation_cache=not args.no_cache,
         model_name=args.model,
+        run_validation=not args.no_validation,
     )
 
 

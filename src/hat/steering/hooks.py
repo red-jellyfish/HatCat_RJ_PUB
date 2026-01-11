@@ -94,7 +94,9 @@ def extract_importance_weighted_vector(
     # Normalize to unit vector
     steering = steering / (steering.norm() + 1e-8)
 
-    return steering.numpy()
+    # Steering vectors stored as FP32 (per dynamic_fp_size.md - "islands of precision")
+    # JIT upcast at hook application handles model dtype compatibility
+    return steering.float().numpy()
 
 
 def load_steering_vectors_from_lens_pack(
