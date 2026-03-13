@@ -39,7 +39,7 @@ poetry install
 poetry shell
 
 # Option 2: Run commands with poetry run
-poetry run python scripts/validate_setup.py
+poetry run python scripts/tools/validate_setup.py
 ```
 
 ## Usage
